@@ -15,4 +15,4 @@ RUN pip uninstall -y pillow && \
 The default font file is also included.
 
 
-Running this is a simple as executing each cell in the [notebook](run.ipynb). Everything else should be self-explanatory, but if you have a question please open an issue.
+Running this is a simple as executing each cell in the [notebook](run_pipeline.ipynb). Everything else should be self-explanatory, but if you have a question please open an issue.
