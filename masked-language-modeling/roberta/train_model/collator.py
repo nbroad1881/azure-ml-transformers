@@ -9,6 +9,10 @@ class DataCollatorForOnlyMaskingLanguageModeling(DataCollatorForLanguageModeling
     Typically, Masked Language Modeling operates on 15% of the tokens. Of those 15%, 80% are masked, 10% are random words, and 10% are the original words.
     This will make 100% of the specified masking probability to be masked tokens. This does NOT do random words or original words.
     (See this for more details: https://huggingface.co/papers/2202.08005)
+
+    When I tested this out, the loss plateaued at a value higher than if the regular collator was used.
+    At this point in time, it is not recommended to use this.
+    TODO: Figure out why this doesn't work as well.
     """
 
 

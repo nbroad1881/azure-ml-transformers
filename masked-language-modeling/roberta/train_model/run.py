@@ -2,9 +2,11 @@ import sys
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from functools import partial
+import random
 
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 import transformers
 from transformers import (
     AutoConfig,
@@ -12,12 +14,15 @@ from transformers import (
     Trainer,
     TrainingArguments,
     HfArgumentParser,
+    DataCollatorForLanguageModeling,
+    set_seed,
 )
+import evaluate
 
-from collator import DataCollatorForOnlyMaskingLanguageModeling
 from modeling_roberta import RobertaForMaskedLM
 
 logger = logging.getLogger(__name__)
+
 
 def setup_logging(config):
     # Setup logging
@@ -50,19 +55,37 @@ def setup_logging(config):
 @dataclass
 class Config(TrainingArguments):
 
-    config_name_or_path: str = field(type=str, default="roberta-base")
-    model_name_or_path: str = field(type=str, default="roberta-base")
-    tokenizer_name_or_path: str = field(type=str, default="roberta-base")
+    config_name_or_path: str = field(
+        default="roberta-base", metadata={"help": "Name or path of the model config."}
+    )
+    model_name_or_path: str = field(
+        default=None, metadata={"help": "If None, trains from scratch."}
+    )
+    tokenizer_name_or_path: str = field(
+        default="roberta-base",
+        metadata={"help": "Name or path of the tokenizer to use."},
+    )
 
-    dataset_directory: str = field(type=str, default="data")
-    dataset_file_glob: str = field(type=str, default="*.parquet")
+    dataset_directory: str = field(
+        default="data", metadata={"help": "Directory containing the dataset files."}
+    )
+    dataset_file_glob: str = field(
+        default="*.parquet",
+        metadata={"help": "Glob pattern to match files in the `dataset_directory`."},
+    )
 
-    validation_split_percentage: float = field(type=float, default=0.01)
+    validation_split_num_samples_or_percentage: float = field(
+        default=0.01,
+        metadata={
+            "help": "If > 1, this is the number of samples to use for validation. If < 1, this is the percentage of samples to use for validation."
+        },
+    )
 
-    masking_probability: float = field(type=float, default=0.2)
+    masking_probability: float = field(
+        default=0.15, metadata={"help": "Probability of masking tokens."}
+    )
 
     attn_implementation: str = field(
-        type=str,
         default="sdpa",
         metadata={
             "help": "choose from {'eager', 'sdpa', 'flash_attention_2'}. Not all models have sdpa or flash_attention_2."
@@ -70,21 +93,57 @@ class Config(TrainingArguments):
     )
 
 
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        # Depending on the model and config, logits may contain extra tensors,
+        # like past_key_values, but logits always come first
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+
+def compute_metrics(eval_preds, metric):
+    preds, labels = eval_preds
+    # preds have the same shape as the labels, after the argmax(-1) has been calculated
+    # by preprocess_logits_for_metrics
+    labels = labels.reshape(-1)
+    preds = preds.reshape(-1)
+    mask = labels != -100
+    labels = labels[mask]
+    preds = preds[mask]
+    return metric.compute(predictions=preds, references=labels)
+
+
 def main():
 
-    arg_parser = HfArgumentParser((Config,))
+    arg_parser = HfArgumentParser(Config)
 
-    config = arg_parser.parse_args()
+    config = arg_parser.parse_args_into_dataclasses()[0]
+
+    set_seed(config.seed)
 
     setup_logging(config)
 
-    tokenized_files = [
-        str(x) for x in Path(config.dataset_directory).rglob(config.dataset_file)
-    ]
+    tokenized_files = list(
+        map(str, Path(config.dataset_directory).rglob(config.dataset_file_glob))
+    )
 
-    ds = load_dataset("parquet", data_files=tokenized_files)
+    ds = load_dataset("parquet", data_files=tokenized_files, split="train")
 
-    ds = ds.train_test_split(test_size=config.validation_split_percentage)
+    if config.validation_split_num_samples_or_percentage > 1:
+        val_indices = random.sample(
+            range(len(ds)), int(config.validation_split_num_samples_or_percentage)
+        )
+        train_indices = [i for i in range(len(ds)) if i not in val_indices]
+
+        ds = DatasetDict(
+            {
+                "train": ds.select(train_indices),
+                "test": ds.select(val_indices),
+            }
+        )
+
+    else:
+        ds = ds.train_test_split(test_size=config.validation_split_percentage)
 
     num_train_samples = len(ds["train"])
     num_eval_samples = len(ds["test"])
@@ -94,20 +153,28 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name_or_path)
 
-    model_config = AutoConfig.from_pretrained(config.config_name_or_path)
-    model_config.vocab_size = len(tokenizer)
-
-    model = RobertaForMaskedLM.from_pretrained(
-        config.model_name_or_path,
-        config=model_config,
+    model_config = AutoConfig.from_pretrained(
+        config.config_name_or_path,
         attn_implementation=config.attn_implementation,
+        vocab_size = len(tokenizer),
     )
+
+    if config.model_name_or_path is not None:
+        # This loads a pretrained model
+        model = RobertaForMaskedLM.from_pretrained(
+            config.model_name_or_path, config=model_config
+        )
+    else:
+        # This creates a model from scratch
+        model = RobertaForMaskedLM(model_config)
 
     model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
 
-    collator = DataCollatorForOnlyMaskingLanguageModeling(
+    collator = DataCollatorForLanguageModeling(
         tokenizer, mlm_probability=config.masking_probability
     )
+
+    metric = evaluate.load("accuracy")
 
     trainer = Trainer(
         model=model,
@@ -116,9 +183,9 @@ def main():
         eval_dataset=ds["test"],
         tokenizer=tokenizer,
         data_collator=collator,
-        preprocess_logits_for_metrics=None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        compute_metrics=partial(compute_metrics, metric=metric),
     )
-
 
     if config.do_train:
         logger.info("*** Training ***")
@@ -126,7 +193,7 @@ def main():
         checkpoint = None
         if config.resume_from_checkpoint:
             checkpoint = config.resume_from_checkpoint
-        
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         trainer.log_metrics("train", train_result.metrics)
@@ -137,12 +204,9 @@ def main():
 
         logger.info("*** Evaluation ***")
 
-
         eval_result = trainer.evaluate()
         trainer.log_metrics("eval", eval_result)
         trainer.save_metrics("eval", eval_result)
-
-
 
 
 if __name__ == "__main__":

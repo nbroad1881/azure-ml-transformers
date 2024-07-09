@@ -2,6 +2,7 @@
 # See here for the Hugging Face Course on Tokenizers: https://huggingface.co/learn/nlp-course/chapter6/1?fw=pt
 
 from argparse import ArgumentParser
+from pathlib import Path
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -11,15 +12,18 @@ def parse_args():
 
     parser = ArgumentParser()
 
-    parser.add_argument("--tokenizer_name", type=str, default="FacebookAI/roberta-base")
+    parser.add_argument("--tokenizer_name", type=str, default="FacebookAI/roberta-base", help="Name of the tokenizer to use. The vocabulary will be retrained, but the underlying tokenizing algorithm will be unchanged.")
     parser.add_argument("--vocab_size", type=int, default=32768, help="Size of the new vocabulary.")
-    parser.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb-edu")
-    parser.add_argument("--dataset_config", type=str, default="CC-MAIN-2024-10")
-    parser.add_argument("--dataset_split", type=str, default="train")
-    parser.add_argument("--streaming", default=False, action="store_true")
-    parser.add_argument("--num_samples", type=int, default=10000)
-    parser.add_argument("--text_column", type=str, default="text")
-    parser.add_argument("--output_dir", type=str, default="output")
+    parser.add_argument("--dataset_name", type=str, default="HuggingFaceFW/fineweb-edu", help="Name of the dataset to use from Hugging Face Hub.")
+    parser.add_argument("--dataset_config", type=str, default="CC-MAIN-2024-10", help="Configuration of the dataset to use from Hugging Face Hub.")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Split of the dataset to use from Hugging Face Hub.")
+    parser.add_argument("--streaming", default=False, action="store_true", help="Whether to stream the dataset.")
+    parser.add_argument("--text_files_directory", type=str, default=None, help="Directory containing text files. If not None, will use these files instead of the dataset from Hugging Face Hub.")
+    parser.add_argument("--text_files_glob", type=str, default=None, help="Glob pattern to match files in the `text_files_directory`.")
+    parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
+    parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to use for training the tokenizer.")
+    parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
+    parser.add_argument("--output_dir", type=str, default="output", help="Directory to save the new tokenizer.")
 
     return parser.parse_args()
 
@@ -28,28 +32,51 @@ def main():
 
     args = parse_args()
 
-    # Note: Instead of streaming, you could also load from local files
-    # See hf.co/docs/datasets for more info
-    dataset = load_dataset(
-        args.dataset_name,
-        args.dataset_config,
-        split=args.dataset_split,
-        streaming=args.streaming,
-    )
+    # Load files from local directory
+    if args.text_files_directory is not None:
+        if "." not in args.text_files_glob:
+            # assume these are parquet files
+            file_ext = "parquet"
+        else:
+            file_ext = args.text_files_glob.split(".")[-1]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+        data_files = list(map(str, Path(args.text_files_directory).rglob(args.text_files_glob)))
+
+        dataset = load_dataset(
+            file_ext,
+            data_files=data_files,
+            split="train",
+        )
+
+    # Pull data from HF Hub
+    else:
+        
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config,
+            split=args.dataset_split,
+            streaming=args.streaming,
+        )
+
+
+    if args.streaming:
+        dataset_iterator = iter(dataset) 
+    else:
+        dataset_iterator = dataset
 
     def text_generator(num_samples, batch_size=1000):
         batch = []
-        for i, sample in enumerate(iter(dataset)):
+        for i, sample in enumerate(dataset_iterator):
             if i == num_samples:
                 break
-            batch.append(sample["text"])
+            batch.append(sample[args.text_column])
             if len(batch) == batch_size:
                 yield batch
                 batch = []
 
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
 
+    
     new_tokenizer = tokenizer.train_new_from_iterator(
         text_generator(args.num_samples), vocab_size=args.vocab_size
     )
