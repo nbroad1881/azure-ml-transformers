@@ -1,12 +1,15 @@
 from argparse import ArgumentParser
 from itertools import chain
 from pathlib import Path
-from collections import defaultdict
+import multiprocessing
+import logging
 
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from datasets import load_dataset
 
+
+logger = logging.getLogger(__name__)
 
 def parse_args():
 
@@ -18,7 +21,7 @@ def parse_args():
     parser.add_argument("--glob_pattern", type=str, default="*.parquet", help="Glob pattern to match files in the `text_files_dir`.")
     parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the tokenized files.")
-    parser.add_argument("--num_proc", type=int, default=1, help="Number of processes to use with the `map` function.")
+    parser.add_argument("--num_proc", type=int, default=-1, help="Number of processes to use with the `map` function. If -1, will use all available CPUs.")
     parser.add_argument("--max_seq_length", type=int, default=512, help="Max number of tokens per input sequence.")
     parser.add_argument("--max_char_length", type=int, default=10000, help="Max number of characters per tokenization. Tokenizers can be slow when working with long texts, thus breaking it into smaller chunks can be more efficient.")
     parser.add_argument("--num_samples_per_file", type=int, default=100000, help="Number of samples per output file")
@@ -30,15 +33,22 @@ def main():
 
     args = parse_args()
 
+    if args.num_proc == -1:
+        args.num_proc = multiprocessing.cpu_count()
+
+        logger.info("Using %s processes", args.num_proc)
+
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name_or_path)
 
 
     all_files = list(map(str, Path(args.text_files_dir).rglob(args.glob_pattern)))
 
+
     ds = load_dataset(
         args.file_type,
         data_files=all_files,
         split="train",
+        num_proc=args.num_proc
     )
 
     def divide_texts(batch):
@@ -76,7 +86,6 @@ def main():
             for k, t in concatenated_examples.items()
         }
         return result
-
 
     ds = ds.map(
         divide_texts,
