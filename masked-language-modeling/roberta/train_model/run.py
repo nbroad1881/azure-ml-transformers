@@ -1,10 +1,12 @@
 import sys
+import random
 import logging
-from dataclasses import dataclass, field
+import multiprocessing
 from pathlib import Path
 from functools import partial
-import random
+from dataclasses import dataclass, field
 
+import evaluate
 import datasets
 from datasets import load_dataset, DatasetDict
 import transformers
@@ -17,7 +19,6 @@ from transformers import (
     DataCollatorForLanguageModeling,
     set_seed,
 )
-import evaluate
 
 from modeling_roberta import RobertaForMaskedLM
 from mlflow_callback import AzureMLflowCallback
@@ -92,6 +93,13 @@ class Config(TrainingArguments):
         },
     )
 
+    num_proc: int = field(
+        default=-1,
+        metadata={
+            "help": "Number of processes to use with the `map` function. If -1, uses all CPUs."
+        },
+    )
+
 
 def preprocess_logits_for_metrics(logits, labels):
     if isinstance(logits, tuple):
@@ -113,8 +121,6 @@ def compute_metrics(eval_preds, metric):
     return metric.compute(predictions=preds, references=labels)
 
 
-
-
 def main():
 
     arg_parser = HfArgumentParser(Config)
@@ -124,23 +130,26 @@ def main():
     set_seed(config.seed)
     setup_logging(config)
 
+    if config.num_proc == -1:
+        config.num_proc = multiprocessing.cpu_count()
+        logger.info("Using %s processes to load dataset.", config.num_proc)
+
     tokenized_files = list(
         map(str, Path(config.tokenized_files_dir).rglob(config.glob_pattern))
     )
 
-    ds = load_dataset("parquet", data_files=tokenized_files, split="train")
+    ds = load_dataset(
+        "parquet", data_files=tokenized_files, split="train", num_proc=config.num_proc
+    )
 
     if config.validation_split_num_samples_or_percentage > 1:
 
-        if len(ds)//20 < config.validation_split_num_samples_or_percentage:
-            num2sample = len(ds)//20
+        if len(ds) // 20 < config.validation_split_num_samples_or_percentage:
+            num2sample = len(ds) // 20
         else:
             num2sample = int(config.validation_split_num_samples_or_percentage)
 
-
-        val_indices = random.sample(
-            range(len(ds)), k=num2sample
-        )
+        val_indices = random.sample(range(len(ds)), k=num2sample)
         train_indices = [i for i in range(len(ds)) if i not in val_indices]
 
         ds = DatasetDict(
@@ -151,7 +160,9 @@ def main():
         )
 
     else:
-        ds = ds.train_test_split(test_size=config.validation_split_num_samples_or_percentage)
+        ds = ds.train_test_split(
+            test_size=config.validation_split_num_samples_or_percentage
+        )
 
     num_train_samples = len(ds["train"])
     num_eval_samples = len(ds["test"])
@@ -164,7 +175,7 @@ def main():
     model_config = AutoConfig.from_pretrained(
         config.config_name_or_path,
         attn_implementation=config.attn_implementation,
-        vocab_size = len(tokenizer),
+        vocab_size=len(tokenizer),
     )
 
     if config.model_name_or_path is not None:
