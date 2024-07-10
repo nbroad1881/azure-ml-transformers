@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the tokenized files.")
     parser.add_argument("--num_proc", type=int, default=1, help="Number of processes to use with the `map` function.")
-    parser.add_argument("--max_seq_length", type=int, default=512, help="Max number of tokens per input sequence.")
+    parser.add_argument("--max_seq_length", type=int, default=1024, help="Max number of tokens per input sequence.")
     parser.add_argument("--max_char_length", type=int, default=10000, help="Max number of characters per tokenization. Tokenizers can be slow when working with long texts, thus breaking it into smaller chunks can be more efficient.")
     parser.add_argument("--num_samples_per_file", type=int, default=100000, help="Number of samples per output file")
 

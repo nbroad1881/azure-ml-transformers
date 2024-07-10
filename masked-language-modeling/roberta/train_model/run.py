@@ -20,12 +20,12 @@ from transformers import (
 import evaluate
 
 from modeling_roberta import RobertaForMaskedLM
+from mlflow_callback import AzureMLflowCallback
 
 logger = logging.getLogger(__name__)
 
 
 def setup_logging(config):
-    # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -66,12 +66,12 @@ class Config(TrainingArguments):
         metadata={"help": "Name or path of the tokenizer to use."},
     )
 
-    dataset_directory: str = field(
+    tokenized_files_dir: str = field(
         default="data", metadata={"help": "Directory containing the dataset files."}
     )
-    dataset_file_glob: str = field(
+    glob_pattern: str = field(
         default="*.parquet",
-        metadata={"help": "Glob pattern to match files in the `dataset_directory`."},
+        metadata={"help": "Glob pattern to match files in the `tokenized_files_dir`."},
     )
 
     validation_split_num_samples_or_percentage: float = field(
@@ -113,6 +113,8 @@ def compute_metrics(eval_preds, metric):
     return metric.compute(predictions=preds, references=labels)
 
 
+
+
 def main():
 
     arg_parser = HfArgumentParser(Config)
@@ -120,18 +122,24 @@ def main():
     config = arg_parser.parse_args_into_dataclasses()[0]
 
     set_seed(config.seed)
-
     setup_logging(config)
 
     tokenized_files = list(
-        map(str, Path(config.dataset_directory).rglob(config.dataset_file_glob))
+        map(str, Path(config.tokenized_files_dir).rglob(config.glob_pattern))
     )
 
     ds = load_dataset("parquet", data_files=tokenized_files, split="train")
 
     if config.validation_split_num_samples_or_percentage > 1:
+
+        if len(ds)//20 < config.validation_split_num_samples_or_percentage:
+            num2sample = len(ds)//20
+        else:
+            num2sample = int(config.validation_split_num_samples_or_percentage)
+
+
         val_indices = random.sample(
-            range(len(ds)), int(config.validation_split_num_samples_or_percentage)
+            range(len(ds)), k=num2sample
         )
         train_indices = [i for i in range(len(ds)) if i not in val_indices]
 
@@ -143,7 +151,7 @@ def main():
         )
 
     else:
-        ds = ds.train_test_split(test_size=config.validation_split_percentage)
+        ds = ds.train_test_split(test_size=config.validation_split_num_samples_or_percentage)
 
     num_train_samples = len(ds["train"])
     num_eval_samples = len(ds["test"])
@@ -185,6 +193,7 @@ def main():
         data_collator=collator,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         compute_metrics=partial(compute_metrics, metric=metric),
+        callbacks=[AzureMLflowCallback()],
     )
 
     if config.do_train:

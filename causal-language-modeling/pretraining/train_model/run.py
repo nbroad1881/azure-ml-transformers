@@ -1,71 +1,42 @@
-import logging
-import math
-import os
 import sys
+import logging
 from dataclasses import dataclass, field
-from typing import Optional
 from pathlib import Path
+from functools import partial
+import random
 
 import datasets
-import evaluate
-from datasets import load_dataset
-
+from datasets import load_dataset, DatasetDict
 import transformers
 from transformers import (
     AutoConfig,
-    AutoModelForCausalLM,
     AutoTokenizer,
-    HfArgumentParser,
+    AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
-    default_data_collator,
+    HfArgumentParser,
+    DataCollatorForLanguageModeling,
     set_seed,
 )
-from transformers.trainer_utils import get_last_checkpoint
+import evaluate
 
-
+from mlflow_callback import AzureMLflowCallback
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ModelArguments:
-    config_path: Optional[str] = field(
-        default=None, metadata={"help": "Path to model configuration to train from scratch."}
-    )
-    tokenizer_path: Optional[str] = field(
-        default=None, metadata={"help": "Path to custom tokenizer."}
-    )
-    attn_implementation: Optional[str] = field(
-        default=None, metadata={"help": "Attention implementation to use. Options: {'eager', 'sdpa', 'flash_attention_2'}"}
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    data_dir: Optional[str] = field(
-        default=None, metadata={"help": "Path to tokenized parquet files. Must have subfolders called train and validation."}
-    )
-
-
-def main():
-
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-
-    # Setup logging
+def setup_logging(config):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    if training_args.should_log:
+    if config.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
         transformers.utils.logging.set_verbosity_info()
 
-    log_level = training_args.get_process_log_level()
+    log_level = config.get_process_log_level()
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
@@ -74,99 +45,177 @@ def main():
 
     # Log on each process the small summary:
     logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        f"Process rank: {config.local_rank}, device: {config.device}, n_gpu: {config.n_gpu}, "
+        + f"distributed training: {config.parallel_mode.value == 'distributed'}, 16-bits training: {config.fp16}"
     )
-    logger.info(f"Training/evaluation parameters {training_args}")
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    logger.info(f"Training/evaluation parameters {config}")
 
-    # Detecting last checkpoint.
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
 
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
+@dataclass
+class Config(TrainingArguments):
 
-    train_files = list(map(str, (Path(data_args.data_dir)/"train").glob("*.parquet")))
-    eval_files = list(map(str, (Path(data_args.data_dir)/"validation").glob("*.parquet")))
+    config_name_or_path: str = field(
+        default="roberta-base", metadata={"help": "Name or path of the model config."}
+    )
+    model_name_or_path: str = field(
+        default=None, metadata={"help": "If None, trains from scratch."}
+    )
+    tokenizer_name_or_path: str = field(
+        default="roberta-base",
+        metadata={"help": "Name or path of the tokenizer to use."},
+    )
 
-    dataset = load_dataset(
-        "parquet",
-        data_files={
-            "train": train_files,
-            "validation": eval_files,
+    tokenized_files_dir: str = field(
+        default="data", metadata={"help": "Directory containing the dataset files."}
+    )
+    glob_pattern: str = field(
+        default="*.parquet",
+        metadata={"help": "Glob pattern to match files in the `tokenized_files_dir`."},
+    )
+
+    validation_split_num_samples_or_percentage: float = field(
+        default=0.01,
+        metadata={
+            "help": "If > 1, this is the number of samples to use for validation. If < 1, this is the percentage of samples to use for validation."
         },
     )
 
-    config = AutoConfig.from_pretrained(model_args.config_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_path)
-    
-    
-    model = AutoModelForCausalLM.from_config(config, attn_implementation=model_args.attn_implementation)
-    n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-    logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
-
-
-    if training_args.do_train:
-        if "train" not in dataset:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = dataset["train"]
-
-    if training_args.do_eval:
-        if "validation" not in dataset:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = dataset["validation"]
-
-        def preprocess_logits_for_metrics(logits, labels):
-            if isinstance(logits, tuple):
-                # Depending on the model and config, logits may contain extra tensors,
-                # like past_key_values, but logits always come first
-                logits = logits[0]
-            return logits.argmax(dim=-1)
-
-        metric = evaluate.load("accuracy")
-
-        def compute_metrics(eval_preds):
-            preds, labels = eval_preds
-            # preds have the same shape as the labels, after the argmax(-1) has been calculated
-            # by preprocess_logits_for_metrics but we need to shift the labels
-            labels = labels[:, 1:].reshape(-1)
-            preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
-
-    # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
-        data_collator=default_data_collator,
-        compute_metrics=compute_metrics,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics
+    masking_probability: float = field(
+        default=0.15, metadata={"help": "Probability of masking tokens."}
     )
 
-    # Training
-    if training_args.do_train:
-        train_result = trainer.train()
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+    attn_implementation: str = field(
+        default="sdpa",
+        metadata={
+            "help": "choose from {'eager', 'sdpa', 'flash_attention_2'}. Not all models have sdpa or flash_attention_2."
+        },
+    )
 
-        metrics = train_result.metrics
-        metrics["train_samples"] = len(train_dataset)
 
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
+def preprocess_logits_for_metrics(logits, labels):
+    if isinstance(logits, tuple):
+        # Depending on the model and config, logits may contain extra tensors,
+        # like past_key_values, but logits always come first
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+
+def compute_metrics(eval_preds, metric):
+    preds, labels = eval_preds
+    # preds have the same shape as the labels, after the argmax(-1) has been calculated
+    # by preprocess_logits_for_metrics but we need to shift the labels
+    labels = labels[:, 1:].reshape(-1)
+    preds = preds[:, :-1].reshape(-1)
+    return metric.compute(predictions=preds, references=labels)
+
+
+def main():
+
+    arg_parser = HfArgumentParser(Config)
+
+    config = arg_parser.parse_args_into_dataclasses()[0]
+
+    set_seed(config.seed)
+    setup_logging(config)
+
+    tokenized_files = list(
+        map(str, Path(config.tokenized_files_dir).rglob(config.glob_pattern))
+    )
+
+    ds = load_dataset("parquet", data_files=tokenized_files, split="train")
+
+    if config.validation_split_num_samples_or_percentage > 1:
+
+        if len(ds) // 20 < config.validation_split_num_samples_or_percentage:
+            num2sample = len(ds) // 20
+        else:
+            num2sample = int(config.validation_split_num_samples_or_percentage)
+
+        val_indices = random.sample(range(len(ds)), k=num2sample)
+        train_indices = [i for i in range(len(ds)) if i not in val_indices]
+
+        ds = DatasetDict(
+            {
+                "train": ds.select(train_indices),
+                "test": ds.select(val_indices),
+            }
+        )
+
+    else:
+        ds = ds.train_test_split(
+            test_size=config.validation_split_num_samples_or_percentage
+        )
+
+    num_train_samples = len(ds["train"])
+    num_eval_samples = len(ds["test"])
+
+    logger.info(f"Number of training samples: {num_train_samples}")
+    logger.info(f"Number of evaluation samples: {num_eval_samples}")
+
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name_or_path)
+
+    model_config = AutoConfig.from_pretrained(
+        config.config_name_or_path,
+        attn_implementation=config.attn_implementation,
+        vocab_size=len(tokenizer),
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.bos_token_id,
+    )
+
+    tokenizer.pad_token = tokenizer.bos_token
+
+    if config.model_name_or_path is not None:
+        # This loads a pretrained model
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name_or_path, config=model_config
+        )
+    else:
+        # This creates a model from scratch
+        model = AutoModelForCausalLM.from_config(model_config)
+
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+
+    collator = DataCollatorForLanguageModeling(
+        tokenizer,
+        mlm=False,
+    )
+
+    metric = evaluate.load("accuracy")
+
+    trainer = Trainer(
+        model=model,
+        args=config,
+        train_dataset=ds["train"],
+        eval_dataset=ds["test"],
+        tokenizer=tokenizer,
+        data_collator=collator,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        compute_metrics=partial(compute_metrics, metric=metric),
+        callbacks=[AzureMLflowCallback()],
+    )
+
+    if config.do_train:
+        logger.info("*** Training ***")
+
+        checkpoint = None
+        if config.resume_from_checkpoint:
+            checkpoint = config.resume_from_checkpoint
+
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
+
+    if config.do_eval:
+
+        logger.info("*** Evaluation ***")
+
+        eval_result = trainer.evaluate()
+        trainer.log_metrics("eval", eval_result)
+        trainer.save_metrics("eval", eval_result)
 
 
 if __name__ == "__main__":

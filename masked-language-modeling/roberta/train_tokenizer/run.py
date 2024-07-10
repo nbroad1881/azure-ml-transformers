@@ -18,11 +18,10 @@ def parse_args():
     parser.add_argument("--dataset_config", type=str, default="CC-MAIN-2024-10", help="Configuration of the dataset to use from Hugging Face Hub.")
     parser.add_argument("--dataset_split", type=str, default="train", help="Split of the dataset to use from Hugging Face Hub.")
     parser.add_argument("--streaming", default=False, action="store_true", help="Whether to stream the dataset.")
-    parser.add_argument("--text_files_directory", type=str, default=None, help="Directory containing text files. If not None, will use these files instead of the dataset from Hugging Face Hub.")
-    parser.add_argument("--text_files_glob", type=str, default=None, help="Glob pattern to match files in the `text_files_directory`.")
+    parser.add_argument("--text_files_dir", type=str, default="text-files", help="Directory containing text files.")
+    parser.add_argument("--glob_pattern", type=str, default=None, help="Glob pattern to match files in the `text_files_dir`.")
     parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
     parser.add_argument("--num_samples", type=int, default=10000, help="Number of samples to use for training the tokenizer.")
-    parser.add_argument("--text_column", type=str, default="text", help="Name of the column containing text data.")
     parser.add_argument("--output_dir", type=str, default="output", help="Directory to save the new tokenizer.")
 
     return parser.parse_args()
@@ -33,14 +32,14 @@ def main():
     args = parse_args()
 
     # Load files from local directory
-    if args.text_files_directory is not None:
-        if "." not in args.text_files_glob:
+    if args.text_files_dir is not None:
+        if "." not in args.glob_pattern:
             # assume these are parquet files
             file_ext = "parquet"
         else:
-            file_ext = args.text_files_glob.split(".")[-1]
+            file_ext = args.glob_pattern.split(".")[-1]
 
-        data_files = list(map(str, Path(args.text_files_directory).rglob(args.text_files_glob)))
+        data_files = list(map(str, Path(args.text_files_dir).rglob(args.glob_pattern)))
 
         dataset = load_dataset(
             file_ext,
